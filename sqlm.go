@@ -3,6 +3,7 @@ package sqlm
 import (
 	"context"
 	"database/sql/driver"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -21,35 +22,42 @@ var (
 	defaultQMonitor = NewQMonitor()
 
 	// this regexp is used to clean-up sequences of ?,?,? in metrics dump and convert them in one ?
-	queryCleanup = regexp.MustCompile(`(,\\?)+`)
+	queryCleanup = regexp.MustCompile(`(,\?)+`)
 	// replace (?), blocks in insert query to empty line
-	insertQueryCleanup = regexp.MustCompile("(?i)values \\(.*$")
+	insertQueryCleanup = regexp.MustCompile(`(?i)values \(.*$`)
 
 	defaultTracer = otel.Tracer("storage")
 )
 
-type sqlmConstant string
+type Key string
 
 const (
-	SqlType                      = `sqlType`
-	SqlMaster                    = `master`
-	SqlSlave                     = `slave`
-	contextBeginKey sqlmConstant = `begin`
-	querySpan       sqlmConstant = `querySpan`
+	SqlType       = `sqlType`
+	SqlMaster     = `master`
+	SqlSlave      = `slave`
+	Begin     Key = `begin`
+	QuerySpan Key = `querySpan`
 )
 
 type QHooks struct {
-	DBName string
-	DBHost string
+	RWHost     string //Master Database Host
+	RWDatabase string //Master Database Name
+	RWUser     string //Master Database User
+	ROHost     string //Slave Database Host
+	RODatabase string //Slave Database Name
+	ROUser     string //Slave Database User
 }
 
 type QErrorHook struct{}
 
 func (h *QHooks) Before(ctx context.Context, query string, args ...interface{}) (context.Context, error) {
 	var spanName = ""
+	var isSelectQuery bool = false
+	cleanQuery := queryCleanup.ReplaceAllString(query, "")
 	switch {
 	case strings.HasPrefix(strings.ToLower(query), "select"):
 		spanName = "SQL: SELECT"
+		isSelectQuery = true
 	case strings.HasPrefix(strings.ToLower(query), "update"):
 		spanName = "SQL: UPDATE"
 	case strings.HasPrefix(strings.ToLower(query), "delete"):
@@ -58,22 +66,24 @@ func (h *QHooks) Before(ctx context.Context, query string, args ...interface{}) 
 		spanName = "SQL: CREATE"
 	default:
 		spanName = "SQL: OTHER"
+		cleanQuery = insertQueryCleanup.ReplaceAllString(query, "VALUES (? ?)")
 	}
 
 	ctx, span := defaultTracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient))
 	span.SetAttributes(
 		attribute.String("service.name", "mysql"),
-		attribute.String("query", query),
-		attribute.String("db.name", h.DBName),
-		attribute.String("db.address", h.DBHost),
+		attribute.String("db.host", h.getDBHostName(isSelectQuery)),
+		attribute.String("db.database", h.getDatabaseName(isSelectQuery)),
+		attribute.String("db.user", h.getDBUserName(isSelectQuery)),
+		attribute.String("query", cleanQuery),
 	)
 
-	return context.WithValue(context.WithValue(ctx, contextBeginKey, time.Now()), querySpan, span), nil
+	return context.WithValue(context.WithValue(ctx, Begin, time.Now()), QuerySpan, span), nil
 }
 
 func (h *QHooks) After(ctx context.Context, query string, args ...interface{}) (context.Context, error) {
-	begin := ctx.Value("begin").(time.Time)
 	query = queryCleanup.ReplaceAllString(query, "")
+
 	sqlType := SqlMaster
 	if ctxSqlType := ctx.Value(SqlType); ctxSqlType != nil {
 		sqlType = ctxSqlType.(string)
@@ -82,11 +92,11 @@ func (h *QHooks) After(ctx context.Context, query string, args ...interface{}) (
 	if strings.HasPrefix(strings.ToLower(query), "insert") {
 		query = insertQueryCleanup.ReplaceAllString(query, "VALUES (? ?)")
 	}
-	if querySpan := ctx.Value("querySpan"); querySpan != nil {
+
+	begin := ctx.Value(Begin).(time.Time)
+	if querySpan := ctx.Value(QuerySpan); querySpan != nil {
 		span := querySpan.(trace.Span)
-		span.SetAttributes(
-			attribute.String("timeTaken", time.Since(begin).String()),
-		)
+		span.SetAttributes(attribute.String("query.time", fmt.Sprintf("%v", time.Since(begin))))
 		span.End()
 	}
 
@@ -109,10 +119,10 @@ func (h *QHooks) OnError(ctx context.Context, err error, query string, args ...i
 
 	defaultQMonitor.StoreTotal(query, sqlType)
 	defaultQMonitor.StoreErroneous(query, sqlType)
-	begin := ctx.Value("begin").(time.Time)
+	begin := ctx.Value(Begin).(time.Time)
 	defaultQMonitor.StoreLatency(query, time.Since(begin), sqlType)
 
-	if querySpan := ctx.Value("querySpan"); querySpan != nil {
+	if querySpan := ctx.Value(QuerySpan); querySpan != nil {
 		span := querySpan.(trace.Span)
 		span.SetAttributes(
 			attribute.Bool("error", true),
@@ -123,7 +133,29 @@ func (h *QHooks) OnError(ctx context.Context, err error, query string, args ...i
 
 	return err
 }
+func (h *QHooks) getDBHostName(isSelectQuery bool) (host string) {
+	host = h.RWHost
+	if isSelectQuery {
+		host = h.ROHost
+	}
+	return host
+}
 
+func (h *QHooks) getDatabaseName(isSelectQuery bool) (name string) {
+	name = h.RWDatabase
+	if isSelectQuery {
+		name = h.RODatabase
+	}
+	return name
+}
+
+func (h *QHooks) getDBUserName(isSelectQuery bool) (user string) {
+	user = h.RWUser
+	if isSelectQuery {
+		user = h.ROUser
+	}
+	return user
+}
 func init() {
 	prometheus.MustRegister(defaultQMonitor)
 }
