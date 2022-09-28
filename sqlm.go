@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-
 	"time"
 
-	zmmetric "bitbucket.org/orientswiss/metric"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/vsjadeja/metric"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -176,25 +175,25 @@ func NewQMonitor() *QMonitor {
 
 	return &QMonitor{
 		total: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: zmmetric.Namespace,
+			Namespace: metric.Namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_total",
 			Help:      "The total number of query executions.",
 		}, labels),
 		success: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: zmmetric.Namespace,
+			Namespace: metric.Namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_success",
 			Help:      "The number of successfull query executions.",
 		}, labels),
 		errors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: zmmetric.Namespace,
+			Namespace: metric.Namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_error",
 			Help:      "The number of erroneous query executions.",
 		}, labels),
 		latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: zmmetric.Namespace,
+			Namespace: metric.Namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_latency",
 			Help:      "The latency of query execution.",
