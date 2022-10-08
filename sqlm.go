@@ -2,14 +2,17 @@ package sqlm
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/vsjadeja/metric"
+	"github.com/qustavo/sqlhooks/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -39,12 +42,11 @@ const (
 )
 
 type QHooks struct {
-	RWHost     string //Master Database Host
-	RWDatabase string //Master Database Name
-	RWUser     string //Master Database User
-	ROHost     string //Slave Database Host
-	RODatabase string //Slave Database Name
-	ROUser     string //Slave Database User
+	rw              *mysql.Config
+	ro              *mysql.Config
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxIdleTime time.Duration
 }
 
 type QErrorHook struct{}
@@ -133,25 +135,25 @@ func (h *QHooks) OnError(ctx context.Context, err error, query string, args ...i
 	return err
 }
 func (h *QHooks) getDBHostName(isSelectQuery bool) (host string) {
-	host = h.RWHost
-	if isSelectQuery {
-		host = h.ROHost
+	host = h.rw.Addr
+	if isSelectQuery && h.ro.Addr != `` {
+		host = h.ro.Addr
 	}
 	return host
 }
 
 func (h *QHooks) getDatabaseName(isSelectQuery bool) (name string) {
-	name = h.RWDatabase
-	if isSelectQuery {
-		name = h.RODatabase
+	name = h.rw.DBName
+	if isSelectQuery && h.ro.DBName != `` {
+		name = h.ro.DBName
 	}
 	return name
 }
 
 func (h *QHooks) getDBUserName(isSelectQuery bool) (user string) {
-	user = h.RWUser
-	if isSelectQuery {
-		user = h.ROUser
+	user = h.rw.User
+	if isSelectQuery && h.ro.User != `` {
+		user = h.ro.User
 	}
 	return user
 }
@@ -175,25 +177,25 @@ func NewQMonitor() *QMonitor {
 
 	return &QMonitor{
 		total: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metric.Namespace,
+			Namespace: namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_total",
 			Help:      "The total number of query executions.",
 		}, labels),
 		success: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metric.Namespace,
+			Namespace: namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_success",
 			Help:      "The number of successfull query executions.",
 		}, labels),
 		errors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metric.Namespace,
+			Namespace: namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_error",
 			Help:      "The number of erroneous query executions.",
 		}, labels),
 		latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: metric.Namespace,
+			Namespace: namespace,
 			Subsystem: metricSubsystem,
 			Name:      "query_latency",
 			Help:      "The latency of query execution.",
@@ -201,8 +203,6 @@ func NewQMonitor() *QMonitor {
 	}
 }
 
-// Now it removes only the list if IDs.
-// Should be updated if necessary
 func SanitizeQuery(query string) string {
 	var res string
 	re := regexp.MustCompile(`(\d(,?))+`)
@@ -240,6 +240,38 @@ func (mon *QMonitor) Collect(ch chan<- prometheus.Metric) {
 	mon.latency.Collect(ch)
 }
 
+func RegisterDriver(rw *mysql.Config, ro *mysql.Config, maxOpenConns int, maxIdleConns int, connMaxIdleTime time.Duration) (dbRW *sql.DB, dbRO *sql.DB, err error) {
+	mysqlhook := QHooks{rw: rw, ro: ro}
+	sql.Register("mysqlm", sqlhooks.Wrap(&mysql.MySQLDriver{}, &mysqlhook))
+
+	if rw != nil {
+		rwDsn := rw.FormatDSN()
+		dbRW, err = sql.Open(`mysqlm`, rwDsn+fmt.Sprintf("&parseTime=True&loc=%s&time_zone=%s", time.Local.String(), url.QueryEscape("'+00:00'")))
+		if err == nil {
+			dbRW.SetMaxOpenConns(maxOpenConns)
+			dbRW.SetMaxIdleConns(maxIdleConns)
+			dbRW.SetConnMaxIdleTime(connMaxIdleTime)
+			//Registrer RW Database stats
+			err = prometheus.Register(NewGoDBStatsCollector(rw.DBName+`-rw`, dbRW))
+		}
+	}
+
+	if ro != nil {
+		roDsn := ro.FormatDSN()
+		dbRO, err = sql.Open(`mysqlm`, roDsn+fmt.Sprintf("&parseTime=True&loc=%s&time_zone=%s", time.Local.String(), url.QueryEscape("'+00:00'")))
+		if err == nil {
+			dbRO.SetMaxOpenConns(maxOpenConns)
+			dbRO.SetMaxIdleConns(maxIdleConns)
+			dbRO.SetConnMaxIdleTime(connMaxIdleTime)
+			//Registrer RO Database stats
+			err = prometheus.Register(NewGoDBStatsCollector(ro.DBName+`-ro`, dbRO))
+		}
+	}
+
+	return dbRW, dbRO, err
+}
+
 const (
+	namespace       = `dx`
 	metricSubsystem = `sqlm`
 )
