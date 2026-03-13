@@ -1,4 +1,4 @@
-module bitbucket.org/orientswiss/sqlm
+module github.com/vsjadeja/sqlm
 
 go 1.26
 
